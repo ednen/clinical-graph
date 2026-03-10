@@ -137,6 +137,8 @@ async def submit_complaints(form: ComplaintForm):
                         name_en: $name_en,
                         snomed_code: $snomed_code,
                         snomed_term: $snomed_term,
+                        icd11_code: $icd11_code,
+                        icd11_title: $icd11_title,
                         semantic_tag: $semantic_tag,
                         confidence: $confidence
                     })
@@ -147,6 +149,8 @@ async def submit_complaints(form: ComplaintForm):
                     "name_en": sym.name_en,
                     "snomed_code": sym.snomed_code,
                     "snomed_term": sym.snomed_term,
+                    "icd11_code": sym.icd11_code,
+                    "icd11_title": sym.icd11_title,
                     "semantic_tag": sym.semantic_tag,
                     "confidence": sym.confidence,
                 })
@@ -211,6 +215,8 @@ async def submit_complaints(form: ComplaintForm):
                 "name_en": s.name_en,
                 "snomed_code": s.snomed_code,
                 "snomed_term": s.snomed_term,
+                "icd11_code": s.icd11_code,
+                "icd11_title": s.icd11_title,
                 "confidence": s.confidence,
                 "body_site": s.body_site_name,
             }
@@ -400,20 +406,42 @@ async def get_encounter_report(encounter_id: str):
 
 
 @app.get("/api/snomed/search")
-async def search_snomed(term: str, semantic_tag: Optional[str] = None, limit: int = 10):
-    """Manuel SNOMED CT arama (doktor veya geliştirici için)"""
-    matches = await mapper.snowstorm.search_concepts(term, semantic_tag=semantic_tag, limit=limit)
+async def search_snomed(term: str, lang: str = "en", limit: int = 10):
+    """SNOMED + ICD-11 arama (local dict + WHO ICD-11 API)"""
+    from snomed_mapper import TR_EN_SYMPTOM_MAP
+
+    # Local dictionary'den ara
+    results = []
+    term_lower = term.lower()
+    for tr_term, data in TR_EN_SYMPTOM_MAP.items():
+        if term_lower in tr_term or term_lower in data["en"].lower():
+            results.append({
+                "snomed_code": data.get("snomed", "unknown"),
+                "icd11_code": data.get("icd11", ""),
+                "preferred_term": data["en"],
+                "turkish_term": tr_term,
+                "source": "local_dictionary",
+            })
+        if len(results) >= limit:
+            break
+
+    # ICD-11 API'den de ara (varsa)
+    icd11_results = []
+    if mapper.icd11:
+        api_results = await mapper.icd11.search(term, lang=lang, max_results=limit)
+        for r in api_results:
+            icd11_results.append({
+                "snomed_code": "",
+                "icd11_code": r.get("icd11_code", ""),
+                "preferred_term": r.get("title", ""),
+                "turkish_term": "",
+                "source": "icd11_api",
+            })
+
     return {
         "query": term,
-        "results": [
-            {
-                "concept_id": m.concept_id,
-                "preferred_term": m.preferred_term,
-                "semantic_tag": m.semantic_tag,
-                "score": m.score,
-            }
-            for m in matches
-        ]
+        "local_results": results,
+        "icd11_results": icd11_results,
     }
 
 
