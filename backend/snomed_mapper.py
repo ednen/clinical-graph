@@ -125,10 +125,24 @@ TR_EN_SYMPTOM_MAP: dict[str, dict] = {
 
     # ── Cerrahi Prosedürler ──
     "apandisit ameliyatı":    {"en": "appendectomy", "snomed": "80146002", "icd11": "JA01"},
+    "apandisit":              {"en": "appendectomy", "snomed": "80146002", "icd11": "JA01"},
     "apendektomi":            {"en": "appendectomy", "snomed": "80146002", "icd11": "JA01"},
     "sezaryen":               {"en": "cesarean section", "snomed": "11466000", "icd11": "JB40"},
     "kolesistektomi":         {"en": "cholecystectomy", "snomed": "38102005", "icd11": "JA63"},
     "safra kesesi ameliyatı": {"en": "cholecystectomy", "snomed": "38102005", "icd11": "JA63"},
+
+    # ── Serbest metin varyasyonları (hastalar böyle yazar) ──
+    "balgam":                 {"en": "productive cough", "snomed": "28743005", "icd11": "MD12.1"},
+    "balgam çıkarıyorum":    {"en": "productive cough", "snomed": "28743005", "icd11": "MD12.1"},
+    "sarı-yeşil balgam":     {"en": "productive cough", "snomed": "28743005", "icd11": "MD12.1"},
+    "göğsümde ağrı":         {"en": "chest pain", "snomed": "29857009", "icd11": "MD30"},
+    "sırtımda ağrı":         {"en": "back pain", "snomed": "161891005", "icd11": "ME84"},
+    "nefes alamıyorum":      {"en": "dyspnea", "snomed": "267036007", "icd11": "MD11"},
+    "ateşim var":            {"en": "fever", "snomed": "386661006", "icd11": "MG26"},
+    "başım ağrıyor":         {"en": "headache", "snomed": "25064002", "icd11": "MB40"},
+    "karnım ağrıyor":        {"en": "abdominal pain", "snomed": "21522001", "icd11": "ME04"},
+    "midem bulanıyor":       {"en": "nausea", "snomed": "422587007", "icd11": "ME05.0"},
+    "öksürüyorum":           {"en": "cough", "snomed": "49727002", "icd11": "MD12"},
 }
 
 
@@ -281,6 +295,30 @@ class ICD11Client:
 class TurkishSymptomPreprocessor:
     """Türkçe şikayet metnini normalize eder ve token'lara ayırır."""
 
+    # Semptom olmayan ifadeler — filtrele
+    STOP_PHRASES = [
+        "kesinlikle kullanamam", "kesinlikle", "kullanamam",
+        "başka ameliyatım yok", "başka yok",
+        "var", "yok", "oldu", "oluyor", "olacak",
+        "çok", "biraz", "bazen", "sürekli", "arada bir",
+        "yaklaşık", "tahminen", "gibi", "kadar",
+        "sabahları", "akşamları", "geceleri",
+        "renkli", "sarı-yeşil renkli",
+    ]
+
+    # Türkçe hal ekleri — kök bulmak için soyulacak
+    SUFFIXES = [
+        "ımda", "imde", "umda", "ümde",  # -mda lokasyon
+        "ında", "inde", "unda", "ünde",
+        "sümde", "sımda",
+        "ım", "im", "um", "üm",          # iyelik
+        "ın", "in", "un", "ün",
+        "da", "de", "ta", "te",           # bulunma
+        "dan", "den", "tan", "ten",       # ayrılma
+        "ları", "leri",                    # çoğul
+        "dır", "dir", "dur", "dür",
+    ]
+
     @staticmethod
     def normalize(text: str) -> str:
         import re
@@ -290,11 +328,48 @@ class TurkishSymptomPreprocessor:
         return text
 
     @staticmethod
+    def strip_turkish_suffix(word: str) -> str:
+        """Türkçe hal eklerini basitçe soy — kök kelimeyi bulmaya çalış"""
+        for suffix in TurkishSymptomPreprocessor.SUFFIXES:
+            if word.endswith(suffix) and len(word) - len(suffix) >= 2:
+                return word[:-len(suffix)]
+        return word
+
+    @staticmethod
+    def clean_token(token: str) -> str:
+        """Tek bir token'ı temizle: stop phrase çıkar, yılları soy"""
+        import re
+        # Yıl prefix'ini çıkar: "2015 apandisit ameliyatı" → "apandisit ameliyatı"
+        token = re.sub(r'^\d{4}\s+', '', token)
+        # "var" / "yok" suffix temizle
+        token = re.sub(r'\s+(var|yok)$', '', token)
+        # "balgam çıkarıyorum" → "balgam" gibi fiil temizleme
+        token = re.sub(r'\s+(çıkarıyorum|hissediyorum|yapıyorum|kullanıyorum|yaptım|içtim|oldum|geçiyor|artıyor|azalıyor)$', '', token)
+        return token.strip()
+
+    @staticmethod
     def extract_symptom_tokens(text: str) -> list[str]:
         import re
         text = TurkishSymptomPreprocessor.normalize(text)
         tokens = re.split(r'[,;.\n]|\bve\b', text)
-        return [t.strip() for t in tokens if len(t.strip()) >= 2]
+        cleaned = []
+        for token in tokens:
+            token = token.strip()
+            if len(token) < 2:
+                continue
+            # Stop phrase kontrolü
+            is_stop = False
+            for sp in TurkishSymptomPreprocessor.STOP_PHRASES:
+                if token == sp or token.strip() == sp:
+                    is_stop = True
+                    break
+            if is_stop:
+                continue
+            # Token temizle
+            token = TurkishSymptomPreprocessor.clean_token(token)
+            if len(token) >= 2:
+                cleaned.append(token)
+        return cleaned
 
     @staticmethod
     def extract_severity(text: str) -> Optional[int]:
@@ -336,8 +411,12 @@ class SnomedMapper:
         """Tek bir Türkçe semptomu SNOMED + ICD-11'e map et."""
         normalized = self.preprocessor.normalize(symptom_text_tr)
 
-        # Step 1: Local dictionary
+        # Step 1: Exact dictionary match
         local = TR_EN_SYMPTOM_MAP.get(normalized)
+
+        # Step 2: Fuzzy — suffix strip + partial match
+        if not local:
+            local = self._fuzzy_local_match(normalized)
 
         if local:
             result = MappedSymptom(
@@ -385,6 +464,47 @@ class SnomedMapper:
 
         return None
 
+    def _fuzzy_local_match(self, text: str) -> Optional[dict]:
+        """
+        Serbest Türkçe metni dictionary'de fuzzy eşleştir.
+        Stratejiler:
+        1. Her kelimenin suffix'ini soy, dictionary key'lerinde ara
+        2. Dictionary key'i text içinde geçiyor mu kontrol et
+        3. Text içindeki kelimeler dictionary key'inde geçiyor mu
+        """
+        # Strateji 1: Text'teki her kelimeyi suffix-strip yap, dictionary'de substring ara
+        words = text.split()
+        stripped_words = [self.preprocessor.strip_turkish_suffix(w) for w in words]
+
+        best_match = None
+        best_score = 0
+
+        for dict_key, dict_val in TR_EN_SYMPTOM_MAP.items():
+            score = 0
+
+            # Strateji 2: dictionary key text içinde geçiyor mu?
+            if dict_key in text:
+                score = len(dict_key) * 3  # uzun eşleşme = daha iyi
+
+            # Strateji 3: stripped kelimeler dict_key içinde geçiyor mu?
+            if score == 0:
+                for sw in stripped_words:
+                    if len(sw) >= 3 and sw in dict_key:
+                        score += len(sw) * 2
+                    # dict_key kelimeleri stripped'de geçiyor mu?
+                    for dk_word in dict_key.split():
+                        if len(dk_word) >= 3 and dk_word in sw:
+                            score += len(dk_word) * 2
+
+            if score > best_score:
+                best_score = score
+                best_match = dict_val
+
+        # Minimum skor eşiği — çok zayıf eşleşmeleri filtrele
+        if best_score >= 6 and best_match:
+            return best_match
+        return None
+
     async def map_complaint_form(self, form_data: dict) -> MappingResult:
         """Tam bir hasta şikayet formunu map et."""
         result = MappingResult()
@@ -397,9 +517,15 @@ class SnomedMapper:
             tokens = self.preprocessor.extract_symptom_tokens(text)
             for token in tokens:
                 mapped = await self.map_symptom(token)
-                if mapped and mapped.snomed_code not in existing_codes:
-                    existing_codes.add(mapped.snomed_code)
-                    result.mapped.append(mapped)
+                if mapped:
+                    # Deduplicate: aynı snomed+icd11 kombinasyonunu tekrar ekleme
+                    code_key = f"{mapped.snomed_code}_{mapped.icd11_code}"
+                    if code_key not in existing_codes and mapped.snomed_code != "unknown":
+                        existing_codes.add(code_key)
+                        result.mapped.append(mapped)
+                    elif mapped.snomed_code == "unknown" and mapped.icd11_code not in existing_codes:
+                        existing_codes.add(mapped.icd11_code)
+                        result.mapped.append(mapped)
                 elif not mapped and len(token) > 3:
                     result.unmapped.append(token)
 
