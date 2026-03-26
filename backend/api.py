@@ -25,12 +25,13 @@ import uuid
 import os
 
 from snomed_mapper import SnomedMapper, MappingResult
+from security import sanitize_text, validate_form
 
 # ─── Config ──────────────────────────────────────────────────
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "clinical2026")
 
 app = FastAPI(
     title="Hasta Şikayet Sistemi",
@@ -96,110 +97,121 @@ def get_neo4j_driver():
 @app.post("/api/complaints/submit", response_model=SubmitResponse)
 async def submit_complaints(form: ComplaintForm):
     """
-    Hasta şikayet formunu al → SNOMED map et → Neo4j'e yaz → sonuç dön
+    Hasta şikayet formunu al → Güvenlik kontrol → SNOMED map → Neo4j'e yaz
     """
+    form_dict = form.model_dump()
+
+    # ── Security: Zararlı input kontrolü ──
+    is_valid, reasons = validate_form(form_dict)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail={
+            "error": "Zararli input tespit edildi",
+            "reasons": reasons,
+        })
+
     patient_id = form.patient_id or f"P-{datetime.now().strftime('%Y')}-{uuid.uuid4().hex[:5].upper()}"
     encounter_id = f"ENC-{datetime.now().strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:5].upper()}"
 
-    # 1. SNOMED Mapping
-    form_dict = form.model_dump()
+    # 1. SNOMED + ICD-11 Mapping
     mapping_result: MappingResult = await mapper.map_complaint_form(form_dict)
 
-    # 2. Neo4j'e yaz
+    # 2. Kategorize Neo4j yazma
     driver = get_neo4j_driver()
     try:
         async with driver.session() as session:
-            # Patient ve Encounter oluştur
+            # Patient + Encounter
             await session.run("""
                 MERGE (p:Patient {patient_id: $patient_id})
                 CREATE (e:Encounter {
                     encounter_id: $encounter_id,
                     created_at: datetime(),
                     status: 'active',
-                    last_oral_intake: $last_oral,
-                    raw_form_data: $raw_form
+                    last_oral_intake: $last_oral
                 })
                 CREATE (p)-[:HAS_ENCOUNTER]->(e)
             """, {
                 "patient_id": patient_id,
                 "encounter_id": encounter_id,
-                "last_oral": form.last_oral_intake_time,
-                "raw_form": str(form_dict),
+                "last_oral": sanitize_text(form.last_oral_intake_time),
             })
 
-            # Semptomları yaz
+            # Kategorize node yazma
             for sym in mapping_result.mapped:
-                await session.run("""
-                    MATCH (e:Encounter {encounter_id: $enc_id})
-                    CREATE (s:Symptom {
-                        symptom_id: randomUUID(),
-                        name_tr: $name_tr,
-                        name_en: $name_en,
-                        snomed_code: $snomed_code,
-                        snomed_term: $snomed_term,
-                        icd11_code: $icd11_code,
-                        icd11_title: $icd11_title,
-                        semantic_tag: $semantic_tag,
-                        confidence: $confidence
-                    })
-                    CREATE (e)-[:PRESENTS_WITH]->(s)
-                """, {
-                    "enc_id": encounter_id,
-                    "name_tr": sym.original_text_tr,
-                    "name_en": sym.name_en,
-                    "snomed_code": sym.snomed_code,
-                    "snomed_term": sym.snomed_term,
-                    "icd11_code": sym.icd11_code,
-                    "icd11_title": sym.icd11_title,
-                    "semantic_tag": sym.semantic_tag,
-                    "confidence": sym.confidence,
-                })
+                cat = sym.semantic_tag
 
-            # Alerji
-            if form.allergies:
-                await session.run("""
-                    MATCH (p:Patient {patient_id: $pid})
-                    CREATE (a:Allergy {
-                        allergy_id: randomUUID(),
-                        substance: $substance,
-                        raw_text: $raw
+                if cat == "symptom":
+                    await session.run("""
+                        MATCH (e:Encounter {encounter_id: $enc_id})
+                        CREATE (s:Symptom {
+                            symptom_id: randomUUID(),
+                            name_tr: $name_tr, name_en: $name_en,
+                            snomed_code: $snomed, icd11_code: $icd11,
+                            icd11_title: $icd11_title, confidence: $conf
+                        })
+                        CREATE (e)-[:PRESENTS_WITH]->(s)
+                    """, {
+                        "enc_id": encounter_id,
+                        "name_tr": sym.original_text_tr, "name_en": sym.name_en,
+                        "snomed": sym.snomed_code, "icd11": sym.icd11_code,
+                        "icd11_title": sym.icd11_title, "conf": sym.confidence,
                     })
-                    CREATE (p)-[:HAS_ALLERGY]->(a)
-                """, {
-                    "pid": patient_id,
-                    "substance": form.allergies,
-                    "raw": form.allergies,
-                })
 
-            # Kronik hastalık
-            if form.chronic_conditions:
-                await session.run("""
-                    MATCH (p:Patient {patient_id: $pid})
-                    CREATE (cc:ChronicCondition {
-                        condition_id: randomUUID(),
-                        name_tr: $name,
-                        status: 'active'
+                elif cat == "allergy":
+                    await session.run("""
+                        MATCH (p:Patient {patient_id: $pid})
+                        CREATE (a:Allergy {
+                            allergy_id: randomUUID(),
+                            substance: $name_tr, name_en: $name_en,
+                            snomed_code: $snomed, icd11_code: $icd11
+                        })
+                        CREATE (p)-[:HAS_ALLERGY]->(a)
+                    """, {
+                        "pid": patient_id,
+                        "name_tr": sym.original_text_tr, "name_en": sym.name_en,
+                        "snomed": sym.snomed_code, "icd11": sym.icd11_code,
                     })
-                    CREATE (p)-[:HAS_CONDITION]->(cc)
-                """, {
-                    "pid": patient_id,
-                    "name": form.chronic_conditions,
-                })
 
-            # İlaç
+                elif cat == "condition":
+                    await session.run("""
+                        MATCH (p:Patient {patient_id: $pid})
+                        CREATE (cc:ChronicCondition {
+                            condition_id: randomUUID(),
+                            name_tr: $name_tr, name_en: $name_en,
+                            snomed_code: $snomed, icd11_code: $icd11,
+                            status: 'active'
+                        })
+                        CREATE (p)-[:HAS_CONDITION]->(cc)
+                    """, {
+                        "pid": patient_id,
+                        "name_tr": sym.original_text_tr, "name_en": sym.name_en,
+                        "snomed": sym.snomed_code, "icd11": sym.icd11_code,
+                    })
+
+                elif cat == "surgery":
+                    await session.run("""
+                        MATCH (p:Patient {patient_id: $pid})
+                        CREATE (sx:Surgery {
+                            surgery_id: randomUUID(),
+                            procedure_name_tr: $name_tr, procedure_name_en: $name_en,
+                            snomed_code: $snomed, icd11_code: $icd11
+                        })
+                        CREATE (p)-[:HAD_SURGERY]->(sx)
+                    """, {
+                        "pid": patient_id,
+                        "name_tr": sym.original_text_tr, "name_en": sym.name_en,
+                        "snomed": sym.snomed_code, "icd11": sym.icd11_code,
+                    })
+
+            # İlaç (raw text — sanitize edilir)
             if form.regular_medications:
                 await session.run("""
                     MATCH (p:Patient {patient_id: $pid})
                     CREATE (m:Medication {
                         medication_id: randomUUID(),
-                        raw_text: $raw,
-                        is_current: true
+                        raw_text: $raw, is_current: true
                     })
                     CREATE (p)-[:TAKES_MEDICATION]->(m)
-                """, {
-                    "pid": patient_id,
-                    "raw": form.regular_medications,
-                })
+                """, {"pid": patient_id, "raw": sanitize_text(form.regular_medications)})
 
     finally:
         await driver.close()
@@ -214,11 +226,10 @@ async def submit_complaints(form: ComplaintForm):
                 "original_tr": s.original_text_tr,
                 "name_en": s.name_en,
                 "snomed_code": s.snomed_code,
-                "snomed_term": s.snomed_term,
                 "icd11_code": s.icd11_code,
                 "icd11_title": s.icd11_title,
+                "category": s.semantic_tag,
                 "confidence": s.confidence,
-                "body_site": s.body_site_name,
             }
             for s in mapping_result.mapped
         ],

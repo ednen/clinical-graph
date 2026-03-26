@@ -506,36 +506,47 @@ class SnomedMapper:
         return None
 
     async def map_complaint_form(self, form_data: dict) -> MappingResult:
-        """Tam bir hasta şikayet formunu map et."""
+        """
+        Tam bir hasta şikayet formunu map et.
+        Her alanı kendi kategorisine yönlendirir — semptomlar, alerjiler, 
+        kronik hastalıklar ve cerrahi geçmiş ayrı tutulur.
+        """
         result = MappingResult()
         existing_codes = set()
 
-        async def map_field(field_key: str):
-            text = form_data.get(field_key, "")
+        async def map_tokens(text: str, category: str = "symptom"):
             if not text:
-                return
+                return []
+            mapped_list = []
             tokens = self.preprocessor.extract_symptom_tokens(text)
             for token in tokens:
                 mapped = await self.map_symptom(token)
                 if mapped:
-                    # Deduplicate: aynı snomed+icd11 kombinasyonunu tekrar ekleme
                     code_key = f"{mapped.snomed_code}_{mapped.icd11_code}"
-                    if code_key not in existing_codes and mapped.snomed_code != "unknown":
+                    if code_key not in existing_codes:
                         existing_codes.add(code_key)
-                        result.mapped.append(mapped)
-                    elif mapped.snomed_code == "unknown" and mapped.icd11_code not in existing_codes:
-                        existing_codes.add(mapped.icd11_code)
-                        result.mapped.append(mapped)
+                        mapped.semantic_tag = category  # kategori etiketi
+                        mapped_list.append(mapped)
                 elif not mapped and len(token) > 3:
                     result.unmapped.append(token)
+            return mapped_list
 
-        # Sırayla tüm form alanlarını map et
-        await map_field("chief_complaints")
-        await map_field("pain_presence")
-        await map_field("additional_complaints")
-        await map_field("allergies")
-        await map_field("chronic_conditions")
-        await map_field("surgical_history")
+        # Semptom alanları → semantic_tag = "symptom"
+        for field in ["chief_complaints", "pain_presence", "additional_complaints"]:
+            items = await map_tokens(form_data.get(field, ""), "symptom")
+            result.mapped.extend(items)
+
+        # Alerji alanı → semantic_tag = "allergy"
+        items = await map_tokens(form_data.get("allergies", ""), "allergy")
+        result.mapped.extend(items)
+
+        # Kronik hastalık → semantic_tag = "condition"
+        items = await map_tokens(form_data.get("chronic_conditions", ""), "condition")
+        result.mapped.extend(items)
+
+        # Cerrahi geçmiş → semantic_tag = "surgery"
+        items = await map_tokens(form_data.get("surgical_history", ""), "surgery")
+        result.mapped.extend(items)
 
         return result
 
